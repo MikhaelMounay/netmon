@@ -155,6 +155,8 @@ struct NetmonApp {
     interface_snapshot: Arc<RwLock<InterfaceStats>>,
     status_snapshot: Arc<RwLock<String>>,
     blocked_pids: Arc<RwLock<HashSet<u32>>>,
+    blocked_threads: Arc<RwLock<HashSet<ThreadKey>>>,
+    blocked_users: Arc<RwLock<HashSet<u32>>>,
 
     status_tx: Sender<String>,
     status_rx: Receiver<String>,
@@ -191,6 +193,8 @@ impl NetmonApp {
         let interface_snapshot = Arc::new(RwLock::new(InterfaceStats::default()));
         let status_snapshot = Arc::new(RwLock::new("Ready".to_string()));
         let blocked_pids = Arc::new(RwLock::new(HashSet::new()));
+        let blocked_threads = Arc::new(RwLock::new(HashSet::new()));
+        let blocked_users = Arc::new(RwLock::new(HashSet::new()));
         let session_history_snapshot = Arc::new(RwLock::new(Vec::new()));
 
         // Phase I Lesson WS-2: bounded channel provides backpressure between capture and UI pipeline.
@@ -204,6 +208,8 @@ impl NetmonApp {
             interface_snapshot.clone(),
             status_snapshot.clone(),
             blocked_pids.clone(),
+            blocked_threads.clone(),
+            blocked_users.clone(),
             session_history_snapshot.clone(),
         ));
 
@@ -221,6 +227,8 @@ impl NetmonApp {
             interface_snapshot,
             status_snapshot,
             blocked_pids,
+            blocked_threads,
+            blocked_users,
             status_tx,
             status_rx,
             selected_thread: None,
@@ -424,6 +432,25 @@ impl NetmonApp {
         }
     }
 
+    // Blocks one thread through nftables and updates local blocked state.
+    fn block_thread(&mut self, pid: u32, tid: u32, thread_name: &str) {
+        match controller::block_thread(pid, tid, thread_name) {
+            Ok(()) => {
+                if let Ok(mut blocked) = self.blocked_threads.write() {
+                    blocked.insert(ThreadKey { pid, tid });
+                }
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Blocked {thread_name} (PID {pid}, TID {tid})");
+                }
+            }
+            Err(e) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Block failed for PID {pid}, TID {tid}: {e}");
+                }
+            }
+        }
+    }
+
     // Unblocks one process through nftables and updates local blocked state.
     fn unblock_pid(&mut self, pid: u32) {
         match controller::unblock_process(pid) {
@@ -439,6 +466,138 @@ impl NetmonApp {
                 if let Ok(mut status) = self.status_snapshot.write() {
                     *status = format!("Unblock failed for PID {pid}: {e}");
                 }
+            }
+        }
+    }
+
+    // Unblocks one thread through nftables and updates local blocked state.
+    fn unblock_thread(&mut self, pid: u32, tid: u32) {
+        match controller::unblock_thread(pid, tid) {
+            Ok(()) => {
+                if let Ok(mut blocked) = self.blocked_threads.write() {
+                    blocked.remove(&ThreadKey { pid, tid });
+                }
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Unblocked PID {pid}, TID {tid}");
+                }
+            }
+            Err(e) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Unblock failed for PID {pid}, TID {tid}: {e}");
+                }
+            }
+        }
+    }
+
+    // Blocks one user through nftables and updates local blocked state.
+    fn block_user(&mut self, uid: u32, username: &str) {
+        match controller::block_user(uid, username) {
+            Ok(()) => {
+                if let Ok(mut blocked) = self.blocked_users.write() {
+                    blocked.insert(uid);
+                }
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Blocked user {username} (UID {uid})");
+                }
+            }
+            Err(e) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Block failed for UID {uid}: {e}");
+                }
+            }
+        }
+    }
+
+    // Unblocks one user through nftables and updates local blocked state.
+    fn unblock_user(&mut self, uid: u32, username: &str) {
+        match controller::unblock_user(uid) {
+            Ok(()) => {
+                if let Ok(mut blocked) = self.blocked_users.write() {
+                    blocked.remove(&uid);
+                }
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Unblocked user {username} (UID {uid})");
+                }
+            }
+            Err(e) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Unblock failed for UID {uid}: {e}");
+                }
+            }
+        }
+    }
+
+    // Limits a selected PID using the controller's rate-limit hook.
+    fn limit_process_bandwidth(&mut self, pid: u32, name: &str) {
+        let Some(rate_kbps) = self.parse_rate_limit_kbps() else {
+            return;
+        };
+
+        match controller::rate_limit_process(pid, rate_kbps) {
+            Ok(()) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Rate-limited {name} (PID {pid}) to {rate_kbps} kbit/s");
+                }
+            }
+            Err(error) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Rate limit failed for PID {pid}: {error}");
+                }
+            }
+        }
+    }
+
+    // Limits a selected thread using the controller's rate-limit hook.
+    fn limit_thread_bandwidth(&mut self, pid: u32, tid: u32, thread_name: &str) {
+        let Some(rate_kbps) = self.parse_rate_limit_kbps() else {
+            return;
+        };
+
+        match controller::rate_limit_thread(pid, tid, rate_kbps) {
+            Ok(()) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!(
+                        "Rate-limited {thread_name} (PID {pid}, TID {tid}) to {rate_kbps} kbit/s"
+                    );
+                }
+            }
+            Err(error) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Rate limit failed for PID {pid}, TID {tid}: {error}");
+                }
+            }
+        }
+    }
+
+    // Limits a selected user using the controller's rate-limit hook.
+    fn limit_user_bandwidth(&mut self, uid: u32, username: &str) {
+        let Some(rate_kbps) = self.parse_rate_limit_kbps() else {
+            return;
+        };
+
+        match controller::rate_limit_user(uid, rate_kbps) {
+            Ok(()) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Rate-limited user {username} (UID {uid}) to {rate_kbps} kbit/s");
+                }
+            }
+            Err(error) => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = format!("Rate limit failed for UID {uid}: {error}");
+                }
+            }
+        }
+    }
+
+    // Parses the rate-limit text box and reports a friendly error if it is empty or invalid.
+    fn parse_rate_limit_kbps(&self) -> Option<u32> {
+        match self.rate_limit_kbps_input.trim().parse::<u32>() {
+            Ok(value) if value > 0 => Some(value),
+            _ => {
+                if let Ok(mut status) = self.status_snapshot.write() {
+                    *status = "Enter a positive kbit/s value before limiting bandwidth".to_string();
+                }
+                None
             }
         }
     }
@@ -784,16 +943,50 @@ impl NetmonApp {
                 self.block_pid(selected_row.info.pid, &selected_row.info.name);
             }
 
+            if ui.button("Block Thread").clicked() {
+                self.block_thread(
+                    selected_row.info.pid,
+                    selected_row.info.tid,
+                    &selected_row.info.thread_name,
+                );
+            }
+
             if ui.button("Block User").clicked() {
-                self.block_user(&selected_row.info.username);
+                self.block_user(selected_row.info.uid, &selected_row.info.username);
             }
 
             ui.label("Limit kbps:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.rate_limit_kbps_input).desired_width(72.0),
             );
-            if ui.button("Limit Bandwidth").clicked() {
-                self.limit_bandwidth(selected_row.info.pid, &selected_row.info.name);
+            if ui.button("Limit Process").clicked() {
+                self.limit_process_bandwidth(selected_row.info.pid, &selected_row.info.name);
+            }
+
+            if ui.button("Limit Thread").clicked() {
+                self.limit_thread_bandwidth(
+                    selected_row.info.pid,
+                    selected_row.info.tid,
+                    &selected_row.info.thread_name,
+                );
+            }
+
+            if ui.button("Limit User").clicked() {
+                self.limit_user_bandwidth(selected_row.info.uid, &selected_row.info.username);
+            }
+
+            ui.separator();
+
+            if ui.button("Unblock Process").clicked() {
+                self.unblock_pid(selected_row.info.pid);
+            }
+
+            if ui.button("Unblock Thread").clicked() {
+                self.unblock_thread(selected_row.info.pid, selected_row.info.tid);
+            }
+
+            if ui.button("Unblock User").clicked() {
+                self.unblock_user(selected_row.info.uid, &selected_row.info.username);
             }
         });
     }
@@ -907,22 +1100,45 @@ impl NetmonApp {
         ui.end_row();
 
         let pid = connection.pid;
+        let tid = connection.tid;
         let process_name = connection.process.clone();
+        let thread_name = connection.thread_name.clone();
+        let user_name = connection.username.clone();
         pid_response.context_menu(|ui| {
             if ui.button("Block Process").clicked() {
                 self.pending_block = Some((pid, process_name.clone()));
                 ui.close_menu();
             }
-            if ui.button("Block User").clicked() {
-                self.block_user(&connection.username);
+            if ui.button("Block Thread").clicked() {
+                self.block_thread(pid, tid, &thread_name);
                 ui.close_menu();
             }
-            if ui.button("Limit Bandwidth").clicked() {
-                self.limit_bandwidth(pid, &process_name);
+            if ui.button("Block User").clicked() {
+                self.block_user(connection.uid, &user_name);
+                ui.close_menu();
+            }
+            if ui.button("Limit Process").clicked() {
+                self.limit_process_bandwidth(pid, &process_name);
+                ui.close_menu();
+            }
+            if ui.button("Limit Thread").clicked() {
+                self.limit_thread_bandwidth(pid, tid, &thread_name);
+                ui.close_menu();
+            }
+            if ui.button("Limit User").clicked() {
+                self.limit_user_bandwidth(connection.uid, &user_name);
                 ui.close_menu();
             }
             if ui.button("Unblock Process").clicked() {
                 self.unblock_pid(pid);
+                ui.close_menu();
+            }
+            if ui.button("Unblock Thread").clicked() {
+                self.unblock_thread(pid, tid);
+                ui.close_menu();
+            }
+            if ui.button("Unblock User").clicked() {
+                self.unblock_user(connection.uid, &user_name);
                 ui.close_menu();
             }
         });
@@ -1224,70 +1440,6 @@ fn draw_connection_table_header(ui: &mut egui::Ui) {
     ui.label(RichText::new("TX").strong());
     ui.label(RichText::new("RX").strong());
     ui.end_row();
-}
-
-impl NetmonApp {
-    // Blocks every active PID currently associated with the given username.
-    fn block_user(&mut self, username: &str) {
-        let rows = self.process_rows();
-        let mut blocked_pids = HashSet::new();
-        let mut blocked_labels = Vec::new();
-        let mut errors = Vec::new();
-
-        for row in rows {
-            if row.info.username != username || !blocked_pids.insert(row.info.pid) {
-                continue;
-            }
-
-            match controller::block_process(row.info.pid, &row.info.name) {
-                Ok(()) => {
-                    blocked_labels.push(format!("{} (PID {})", row.info.name, row.info.pid));
-                    if let Ok(mut blocked) = self.blocked_pids.write() {
-                        blocked.insert(row.info.pid);
-                    }
-                }
-                Err(error) => errors.push(format!("PID {}: {error}", row.info.pid)),
-            }
-        }
-
-        if let Ok(mut status) = self.status_snapshot.write() {
-            if !blocked_labels.is_empty() && errors.is_empty() {
-                *status = format!("Blocked user {username}: {}", blocked_labels.join(", "));
-            } else if !blocked_labels.is_empty() {
-                *status = format!("Blocked user {username} with errors: {}", errors.join("; "));
-            } else if errors.is_empty() {
-                *status = format!("No active processes found for user {username}");
-            } else {
-                *status = format!("Failed to block user {username}: {}", errors.join("; "));
-            }
-        }
-    }
-
-    // Limits a selected PID using the controller's rate-limit hook.
-    fn limit_bandwidth(&mut self, pid: u32, name: &str) {
-        let rate_kbps = match self.rate_limit_kbps_input.trim().parse::<u32>() {
-            Ok(value) if value > 0 => value,
-            _ => {
-                if let Ok(mut status) = self.status_snapshot.write() {
-                    *status = "Enter a positive kbit/s value before limiting bandwidth".to_string();
-                }
-                return;
-            }
-        };
-
-        match controller::rate_limit_process(pid, rate_kbps) {
-            Ok(()) => {
-                if let Ok(mut status) = self.status_snapshot.write() {
-                    *status = format!("Rate-limited {name} (PID {pid}) to {rate_kbps} kbit/s");
-                }
-            }
-            Err(error) => {
-                if let Ok(mut status) = self.status_snapshot.write() {
-                    *status = format!("Rate limit failed for PID {pid}: {error}");
-                }
-            }
-        }
-    }
 }
 
 // Computes a 2-second average from the newest two history samples.

@@ -105,6 +105,7 @@ pub struct ConnectionEntry {
     pub tid: u32,
     pub process: String,
     pub thread_name: String,
+    pub uid: u32,
     pub username: String,
     pub tx_bytes: u64,
     pub rx_bytes: u64,
@@ -215,6 +216,8 @@ pub fn spawn_aggregator_thread(
     interface_snapshot: Arc<RwLock<InterfaceStats>>,
     status_snapshot: Arc<RwLock<String>>,
     blocked_pids: Arc<RwLock<HashSet<u32>>>,
+    blocked_threads: Arc<RwLock<HashSet<ThreadKey>>>,
+    blocked_users: Arc<RwLock<HashSet<u32>>>,
     session_history_snapshot: Arc<RwLock<Vec<HistoryCsvRow>>>,
 ) -> AggregatorControl {
     let join_handle = thread::spawn(move || {
@@ -225,6 +228,8 @@ pub fn spawn_aggregator_thread(
             interface_snapshot,
             status_snapshot,
             blocked_pids,
+            blocked_threads,
+            blocked_users,
             session_history_snapshot,
         );
     });
@@ -352,6 +357,8 @@ fn run_aggregator_loop(
     interface_snapshot: Arc<RwLock<InterfaceStats>>,
     status_snapshot: Arc<RwLock<String>>,
     blocked_pids: Arc<RwLock<HashSet<u32>>>,
+    blocked_threads: Arc<RwLock<HashSet<ThreadKey>>>,
+    blocked_users: Arc<RwLock<HashSet<u32>>>,
     session_history_snapshot: Arc<RwLock<Vec<HistoryCsvRow>>>,
 ) {
     let mut resolver = match Resolver::new() {
@@ -425,6 +432,8 @@ fn run_aggregator_loop(
             &rows_snapshot,
             &interface_snapshot,
             &blocked_pids,
+            &blocked_threads,
+            &blocked_users,
             if_tx_total,
             if_rx_total,
             peak_bw,
@@ -720,6 +729,8 @@ fn publish_snapshots(
     rows_snapshot: &Arc<RwLock<Vec<ProcessRow>>>,
     interface_snapshot: &Arc<RwLock<InterfaceStats>>,
     blocked_pids: &Arc<RwLock<HashSet<u32>>>,
+    blocked_threads: &Arc<RwLock<HashSet<ThreadKey>>>,
+    blocked_users: &Arc<RwLock<HashSet<u32>>>,
     if_tx_total: u64,
     if_rx_total: u64,
     peak_bw: u64,
@@ -727,6 +738,14 @@ fn publish_snapshots(
     if_rx_history: [u64; HISTORY_SLOTS],
 ) {
     let blocked = blocked_pids
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| HashSet::new());
+    let blocked_threads = blocked_threads
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| HashSet::new());
+    let blocked_users = blocked_users
         .read()
         .map(|g| g.clone())
         .unwrap_or_else(|_| HashSet::new());
@@ -770,6 +789,7 @@ fn publish_snapshots(
                 tid: conn.tid,
                 process: conn.process.clone(),
                 thread_name: conn.thread_name.clone(),
+                uid: conn.uid,
                 username: conn.username.clone(),
                 tx_bytes,
                 rx_bytes,
@@ -785,7 +805,9 @@ fn publish_snapshots(
             last_seen: stats.last_seen,
             tx_history: stats.tx_history,
             rx_history: stats.rx_history,
-            is_blocked: blocked.contains(&key.pid),
+            is_blocked: blocked.contains(&key.pid)
+                || blocked_threads.contains(key)
+                || blocked_users.contains(&stats.info.uid),
             connections: conn_by_thread.remove(key).unwrap_or_default(),
         });
     }

@@ -11,6 +11,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
@@ -26,7 +27,7 @@ const NFT_FAMILY: &str = "inet";
 const NFT_OUTPUT_CHAIN: &str = "output";
 
 /// Marker prefix used in nft rule comments so we can find handles later.
-const RULE_COMMENT_PREFIX: &str = "netmon-pid-";
+const RULE_COMMENT_PREFIX: &str = "netmon-";
 
 /// Header rows in `/proc/<pid>/net/*` that must be skipped.
 const PROC_NET_HEADER_INDEX: usize = 0;
@@ -49,11 +50,75 @@ struct RuleRef {
     handle: u64,
 }
 
-static RULES_BY_PID: OnceLock<Mutex<HashMap<u32, Vec<RuleRef>>>> = OnceLock::new();
+static RULES_BY_SCOPE: OnceLock<Mutex<HashMap<String, Vec<RuleRef>>>> = OnceLock::new();
 
 // Returns the singleton in-memory map that tracks inserted rule handles.
-fn rules_map() -> &'static Mutex<HashMap<u32, Vec<RuleRef>>> {
-    RULES_BY_PID.get_or_init(|| Mutex::new(HashMap::new()))
+fn rules_map() -> &'static Mutex<HashMap<String, Vec<RuleRef>>> {
+    RULES_BY_SCOPE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Builds a stable key for in-memory rule tracking.
+fn scope_key(kind: &str, id: impl AsRef<str>) -> String {
+    format!("{kind}:{}", id.as_ref())
+}
+
+// Builds the comment prefix used to discover handles for one scope.
+fn scope_marker(scope_key: &str) -> String {
+    format!("{RULE_COMMENT_PREFIX}{scope_key}-")
+}
+
+// Builds the user-visible comment text for a rule.
+fn scoped_comment(scope_key: &str, label: &str) -> String {
+    format!("{RULE_COMMENT_PREFIX}{scope_key}-{}", label.replace('"', "_"))
+}
+
+// Registers the handles returned by nft for one logical control scope.
+fn register_rule_handles(scope_key: &str, handles: Vec<u64>) -> Result<(), String> {
+    let mut guard = rules_map()
+        .lock()
+        .map_err(|_| "failed to lock rules map".to_string())?;
+    guard.insert(
+        scope_key.to_string(),
+        handles
+            .into_iter()
+            .map(|handle| RuleRef { handle })
+            .collect(),
+    );
+    Ok(())
+}
+
+// Removes handles from the in-memory map, falling back to discovery if needed.
+fn remove_rules_for_scope(scope_key: &str) -> Result<(), String> {
+    let mut handles = Vec::new();
+    {
+        let mut guard = rules_map()
+            .lock()
+            .map_err(|_| "failed to lock rules map".to_string())?;
+        if let Some(refs) = guard.remove(scope_key) {
+            handles.extend(refs.into_iter().map(|rule_ref| rule_ref.handle));
+        }
+    }
+
+    if handles.is_empty() {
+        handles = find_rule_handles_by_marker(&scope_marker(scope_key))?;
+    }
+
+    for handle in handles {
+        run_nft_command(
+            [
+                "delete",
+                "rule",
+                NFT_FAMILY,
+                NFT_TABLE_NAME,
+                NFT_OUTPUT_CHAIN,
+                "handle",
+                &handle.to_string(),
+            ],
+            false,
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Creates the nftables table and output chain used by netmon if missing.
@@ -87,20 +152,21 @@ pub fn setup_nftables() -> Result<(), String> {
 /// Blocks outgoing traffic for a process by inserting nftables drop rules.
 pub fn block_process(pid: u32, process_name: &str) -> Result<(), String> {
     let _ = setup_nftables();
-    let _ = unblock_process(pid);
+    let scope_key = scope_key("proc", pid.to_string());
+    remove_rules_for_scope(&scope_key)?;
 
     let tcp_ports = collect_pid_ports(pid, &["tcp", "tcp6"])?;
     let udp_ports = collect_pid_ports(pid, &["udp", "udp6"])?;
     let uid = read_uid_for_pid(pid);
 
     let safe_name = process_name.replace('"', "_");
-    let comment = format!("{RULE_COMMENT_PREFIX}{pid}-{safe_name}");
+    let comment = scoped_comment(&scope_key, &safe_name);
 
     let rules = if tcp_ports.is_empty() && udp_ports.is_empty() {
         if let Some(uid) = uid {
             format!(
                 "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} \
-                 meta skuid {uid} comment \"{comment}\" drop\n"
+                 meta skuid {uid} drop comment \"{comment}\"\n"
             )
         } else {
             return Err(format!(
@@ -113,18 +179,12 @@ pub fn block_process(pid: u32, process_name: &str) -> Result<(), String> {
 
     run_nft_script(&rules)?;
 
-    let handles = find_rule_handles_for_pid(pid)?;
+    let handles = find_rule_handles_by_marker(&scope_marker(&scope_key))?;
     if handles.is_empty() {
         return Err("Inserted rules but could not find nft handles".to_string());
     }
 
-    let mut guard = rules_map()
-        .lock()
-        .map_err(|_| "failed to lock rules map".to_string())?;
-    guard.insert(
-        pid,
-        handles.into_iter().map(|h| RuleRef { handle: h }).collect(),
-    );
+    register_rule_handles(&scope_key, handles)?;
 
     Ok(())
 }
@@ -132,38 +192,71 @@ pub fn block_process(pid: u32, process_name: &str) -> Result<(), String> {
 /// Removes all tracked nftables rules associated with one process ID.
 pub fn unblock_process(pid: u32) -> Result<(), String> {
     // Phase I Lesson TC-3: ensure reversible control actions with explicit rollback path.
-    let mut handles = Vec::new();
-    {
-        let mut guard = rules_map()
-            .lock()
-            .map_err(|_| "failed to lock rules map".to_string())?;
-        if let Some(refs) = guard.remove(&pid) {
-            for r in refs {
-                handles.push(r.handle);
-            }
-        }
+    remove_rules_for_scope(&scope_key("proc", pid.to_string()))?;
+    remove_rules_for_scope(&scope_key("rate-proc", pid.to_string()))
+}
+
+/// Blocks outgoing traffic for one thread by inserting nftables drop rules.
+pub fn block_thread(pid: u32, tid: u32, thread_name: &str) -> Result<(), String> {
+    let _ = setup_nftables();
+    let scope_key = scope_key("thread", format!("{pid}:{tid}"));
+    remove_rules_for_scope(&scope_key)?;
+
+    let tcp_ports = collect_thread_ports(pid, tid, &["tcp", "tcp6"])?;
+    let udp_ports = collect_thread_ports(pid, tid, &["udp", "udp6"])?;
+
+    if tcp_ports.is_empty() && udp_ports.is_empty() {
+        return Err(format!("No TCP/UDP ports found for PID {pid} TID {tid}"));
     }
 
+    let safe_name = thread_name.replace('"', "_");
+    let comment = scoped_comment(&scope_key, &safe_name);
+    let rules = build_block_ruleset(&tcp_ports, &udp_ports, &comment);
+
+    run_nft_script(&rules)?;
+
+    let handles = find_rule_handles_by_marker(&scope_marker(&scope_key))?;
     if handles.is_empty() {
-        handles = find_rule_handles_for_pid(pid)?;
+        return Err("Inserted thread block rules but could not find nft handles".to_string());
     }
 
-    for handle in handles {
-        run_nft_command(
-            [
-                "delete",
-                "rule",
-                NFT_FAMILY,
-                NFT_TABLE_NAME,
-                NFT_OUTPUT_CHAIN,
-                "handle",
-                &handle.to_string(),
-            ],
-            false,
-        )?;
-    }
-
+    register_rule_handles(&scope_key, handles)?;
     Ok(())
+}
+
+/// Removes all tracked nftables rules associated with one thread.
+pub fn unblock_thread(pid: u32, tid: u32) -> Result<(), String> {
+    remove_rules_for_scope(&scope_key("thread", format!("{pid}:{tid}")))?;
+    remove_rules_for_scope(&scope_key("rate-thread", format!("{pid}:{tid}")))
+}
+
+/// Blocks outgoing traffic for one user by UID.
+pub fn block_user(uid: u32, username: &str) -> Result<(), String> {
+    let _ = setup_nftables();
+    let scope_key = scope_key("user", uid.to_string());
+    remove_rules_for_scope(&scope_key)?;
+
+    let safe_name = username.replace('"', "_");
+    let comment = scoped_comment(&scope_key, &safe_name);
+    let rule = format!(
+        "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} meta skuid {uid} drop comment \"{comment}\"\n"
+    );
+
+    run_nft_script(&rule)?;
+
+    let handles = find_rule_handles_by_marker(&scope_marker(&scope_key))?;
+    if handles.is_empty() {
+        return Err("Inserted user block rules but could not find nft handles".to_string());
+    }
+
+    register_rule_handles(&scope_key, handles)?;
+    Ok(())
+}
+
+/// Removes all tracked nftables rules associated with one user.
+pub fn unblock_user(uid: u32) -> Result<(), String> {
+    remove_rules_for_scope(&scope_key("user", uid.to_string()))?;
+    remove_rules_for_scope(&scope_key("rate-user", uid.to_string()))
 }
 
 /// Flushes the output chain and clears all tracked process-to-rule mappings.
@@ -196,20 +289,20 @@ pub fn list_rules() -> Result<Vec<String>, String> {
 pub fn rate_limit_process(pid: u32, rate_kbps: u32) -> Result<(), String> {
     let _ = setup_nftables();
 
-    remove_rate_limit_rules_for_pid(pid)?;
+    let scope_key = scope_key("rate-proc", pid.to_string());
+    remove_rules_for_scope(&scope_key)?;
 
     let tcp_ports = collect_pid_ports(pid, &["tcp", "tcp6"])?;
     let udp_ports = collect_pid_ports(pid, &["udp", "udp6"])?;
     let uid = read_uid_for_pid(pid);
 
-    let comment = format!("{RULE_COMMENT_PREFIX}{pid}-rate-limit");
+    let comment = scoped_comment(&scope_key, "rate-limit");
 
     let rules = if tcp_ports.is_empty() && udp_ports.is_empty() {
         if let Some(uid) = uid {
             format!(
                 "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} \
-                 meta skuid {uid} limit rate over {rate_kbps} kbytes/second \
-                 comment \"{comment}\" drop\n"
+                 meta skuid {uid} quota over {rate_kbps} kbytes/second drop comment \"{comment}\"\n"
             )
         } else {
             return Err(format!(
@@ -222,20 +315,64 @@ pub fn rate_limit_process(pid: u32, rate_kbps: u32) -> Result<(), String> {
 
     run_nft_script(&rules)?;
 
-    let handles = find_rule_handles_for_pid_comment(pid, "rate-limit")?;
+    let handles = find_rule_handles_by_marker(&scope_marker(&scope_key))?;
     if handles.is_empty() {
         return Err("Inserted rate-limit rules but could not find nft handles".to_string());
     }
 
-    let rate_limit_sentinel_pid = pid | 0x8000_0000;
-    let mut guard = rules_map()
-        .lock()
-        .map_err(|_| "failed to lock rules map".to_string())?;
-    guard.insert(
-        rate_limit_sentinel_pid,
-        handles.into_iter().map(|h| RuleRef { handle: h }).collect(),
+    register_rule_handles(&scope_key, handles)?;
+
+    Ok(())
+}
+
+/// Limits the bandwidth for one thread.
+pub fn rate_limit_thread(pid: u32, tid: u32, rate_kbps: u32) -> Result<(), String> {
+    let _ = setup_nftables();
+
+    let scope_key = scope_key("rate-thread", format!("{pid}:{tid}"));
+    remove_rules_for_scope(&scope_key)?;
+
+    let tcp_ports = collect_thread_ports(pid, tid, &["tcp", "tcp6"])?;
+    let udp_ports = collect_thread_ports(pid, tid, &["udp", "udp6"])?;
+
+    if tcp_ports.is_empty() && udp_ports.is_empty() {
+        return Err(format!("No TCP/UDP ports found for PID {pid} TID {tid}"));
+    }
+
+    let comment = scoped_comment(&scope_key, "rate-limit");
+    let rules = build_rate_limit_ruleset(&tcp_ports, &udp_ports, &comment, rate_kbps);
+
+    run_nft_script(&rules)?;
+
+    let handles = find_rule_handles_by_marker(&scope_marker(&scope_key))?;
+    if handles.is_empty() {
+        return Err("Inserted thread rate-limit rules but could not find nft handles".to_string());
+    }
+
+    register_rule_handles(&scope_key, handles)?;
+    Ok(())
+}
+
+/// Limits the bandwidth for one user by UID.
+pub fn rate_limit_user(uid: u32, rate_kbps: u32) -> Result<(), String> {
+    let _ = setup_nftables();
+
+    let scope_key = scope_key("rate-user", uid.to_string());
+    remove_rules_for_scope(&scope_key)?;
+
+    let comment = scoped_comment(&scope_key, "rate-limit");
+    let rule = format!(
+        "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} meta skuid {uid} quota over {rate_kbps} kbytes/second drop comment \"{comment}\"\n"
     );
 
+    run_nft_script(&rule)?;
+
+    let handles = find_rule_handles_by_marker(&scope_marker(&scope_key))?;
+    if handles.is_empty() {
+        return Err("Inserted user rate-limit rules but could not find nft handles".to_string());
+    }
+
+    register_rule_handles(&scope_key, handles)?;
     Ok(())
 }
 
@@ -245,14 +382,14 @@ fn build_block_ruleset(tcp_ports: &BTreeSet<u16>, udp_ports: &BTreeSet<u16>, com
 
     if !tcp_ports.is_empty() {
         ruleset.push_str(&format!(
-            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} tcp sport {{ {} }} comment \"{}\" drop\n",
+            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} tcp sport {{ {} }} drop comment \"{}\"\n",
             join_ports(tcp_ports),
             comment
         ));
     }
     if !udp_ports.is_empty() {
         ruleset.push_str(&format!(
-            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} udp sport {{ {} }} comment \"{}\" drop\n",
+            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} udp sport {{ {} }} drop comment \"{}\"\n",
             join_ports(udp_ports),
             comment
         ));
@@ -273,7 +410,7 @@ fn build_rate_limit_ruleset(
 
     if !tcp_ports.is_empty() {
         ruleset.push_str(&format!(
-            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} tcp sport {{ {} }} limit rate over {} comment \"{}\" drop\n",
+            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} tcp sport {{ {} }} quota over {} drop comment \"{}\"\n",
             join_ports(tcp_ports),
             rate_expr,
             comment
@@ -281,7 +418,7 @@ fn build_rate_limit_ruleset(
     }
     if !udp_ports.is_empty() {
         ruleset.push_str(&format!(
-            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} udp sport {{ {} }} limit rate over {} comment \"{}\" drop\n",
+            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} udp sport {{ {} }} quota over {} drop comment \"{}\"\n",
             join_ports(udp_ports),
             rate_expr,
             comment
@@ -292,11 +429,26 @@ fn build_rate_limit_ruleset(
 }
 
 // Reads source ports used by a PID from `/proc/<pid>/net/{tcp,tcp6,udp,udp6}`.
-fn collect_pid_ports(pid: u32, files: &[&str]) -> Result<BTreeSet<u16>, String> {
+fn collect_pid_ports(_pid: u32, files: &[&str]) -> Result<BTreeSet<u16>, String> {
+    collect_net_table_ports(files, None)
+}
+
+// Reads source ports used by a single thread by following the thread's socket fds.
+fn collect_thread_ports(pid: u32, tid: u32, files: &[&str]) -> Result<BTreeSet<u16>, String> {
+    let fd_path = format!("/proc/{pid}/task/{tid}/fd");
+    let socket_inodes = collect_socket_inodes(&fd_path);
+    collect_net_table_ports(files, Some(&socket_inodes))
+}
+
+// Reads source ports from `/proc/net/*`, optionally filtering by socket inode.
+fn collect_net_table_ports(
+    files: &[&str],
+    inode_filter: Option<&BTreeSet<u64>>,
+) -> Result<BTreeSet<u16>, String> {
     let mut ports = BTreeSet::new();
 
     for file in files {
-        let path = format!("/proc/{pid}/net/{file}");
+        let path = format!("/proc/net/{file}");
         let content = match fs::read_to_string(&path) {
             Ok(v) => v,
             Err(_) => continue,
@@ -310,6 +462,16 @@ fn collect_pid_ports(pid: u32, files: &[&str]) -> Result<BTreeSet<u16>, String> 
             if cols.len() < PROC_NET_PORT_COLUMN_COUNT {
                 continue;
             }
+            let inode = match cols[9].parse::<u64>() {
+                Ok(inode) => inode,
+                Err(_) => continue,
+            };
+            if let Some(filter) = inode_filter {
+                if !filter.contains(&inode) {
+                    continue;
+                }
+            }
+
             if let Some(port) = parse_port_from_proc_addr(cols[1]) {
                 ports.insert(port);
             }
@@ -319,12 +481,48 @@ fn collect_pid_ports(pid: u32, files: &[&str]) -> Result<BTreeSet<u16>, String> 
     Ok(ports)
 }
 
+// Collects socket inode numbers from /proc/<pid>/task/<tid>/fd.
+fn collect_socket_inodes(fd_path: &str) -> BTreeSet<u64> {
+    let mut inodes = BTreeSet::new();
+
+    let entries = match fs::read_dir(fd_path) {
+        Ok(entries) => entries,
+        Err(_) => return inodes,
+    };
+
+    for entry in entries.flatten() {
+        let target = match fs::read_link(entry.path()) {
+            Ok(target) => target,
+            Err(_) => continue,
+        };
+
+        if let Some(inode) = parse_socket_inode(&target) {
+            inodes.insert(inode);
+        }
+    }
+
+    inodes
+}
+
 // Parses the local endpoint field and returns only the local source port.
 fn parse_port_from_proc_addr(proc_addr: &str) -> Option<u16> {
     let mut parts = proc_addr.split(':');
     let _ip = parts.next()?;
     let port_hex = parts.next()?;
     u16::from_str_radix(port_hex, 16).ok()
+}
+
+// Parses symlinks like `socket:[12345]` into raw inode numbers.
+fn parse_socket_inode(target: &Path) -> Option<u64> {
+    let target_text = target.to_string_lossy();
+    let prefix = "socket:[";
+
+    if !target_text.starts_with(prefix) || !target_text.ends_with(']') {
+        return None;
+    }
+
+    let inode_text = &target_text[prefix.len()..target_text.len() - 1];
+    inode_text.parse::<u64>().ok()
 }
 
 // Reads the effective UID of a process from /proc/<pid>/status.
@@ -347,7 +545,7 @@ fn join_ports(ports: &BTreeSet<u16>) -> String {
         .join(", ")
 }
 
-    // Executes `nft -f -` and sends the provided ruleset through stdin.
+// Executes `nft -f -` and sends the provided ruleset through stdin.
 fn run_nft_script(script: &str) -> Result<(), String> {
     let mut child = Command::new("nft")
         .args(["-f", "-"])
@@ -404,8 +602,8 @@ fn map_nft_spawn_error(err: std::io::Error) -> String {
     format!("failed to run nft: {err}")
 }
 
-// Finds nft rule handles by scanning chain lines with this process comment marker.
-fn find_rule_handles_for_pid(pid: u32) -> Result<Vec<u64>, String> {
+// Finds nft rule handles by scanning chain lines with this comment marker.
+fn find_rule_handles_by_marker(marker: &str) -> Result<Vec<u64>, String> {
     let output = Command::new("nft")
         .args(["-a", "list", "chain", NFT_FAMILY, NFT_TABLE_NAME, NFT_OUTPUT_CHAIN])
         .output()
@@ -417,65 +615,6 @@ fn find_rule_handles_for_pid(pid: u32) -> Result<Vec<u64>, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let marker = format!("{RULE_COMMENT_PREFIX}{pid}-");
-    let mut handles = Vec::new();
-
-    for line in stdout.lines() {
-        if !line.contains(&marker) {
-            continue;
-        }
-        if let Some(idx) = line.rfind("handle ") {
-            let handle_txt = line[(idx + 7)..].trim();
-            if let Ok(handle) = handle_txt.parse::<u64>() {
-                handles.push(handle);
-            }
-        }
-    }
-
-    Ok(handles)
-}
-
-// Removes any existing rate-limit rules for this PID without touching block rules.
-fn remove_rate_limit_rules_for_pid(pid: u32) -> Result<(), String> {
-    let sentinel = pid | 0x8000_0000;
-    let mut handles = Vec::new();
-    {
-        let mut guard = rules_map()
-            .lock()
-            .map_err(|_| "failed to lock rules map".to_string())?;
-        if let Some(refs) = guard.remove(&sentinel) {
-            handles.extend(refs.into_iter().map(|r| r.handle));
-        }
-    }
-    if handles.is_empty() {
-        handles = find_rule_handles_for_pid_comment(pid, "rate-limit")?;
-    }
-    for handle in handles {
-        run_nft_command(
-            [
-                "delete", "rule", NFT_FAMILY, NFT_TABLE_NAME,
-                NFT_OUTPUT_CHAIN, "handle", &handle.to_string(),
-            ],
-            false,
-        )?;
-    }
-    Ok(())
-}
-
-// Like find_rule_handles_for_pid but matches a specific comment suffix.
-fn find_rule_handles_for_pid_comment(pid: u32, suffix: &str) -> Result<Vec<u64>, String> {
-    let output = Command::new("nft")
-        .args(["-a", "list", "chain", NFT_FAMILY, NFT_TABLE_NAME, NFT_OUTPUT_CHAIN])
-        .output()
-        .map_err(|e| format!("failed to run nft list -a: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(format!("nft list -a failed: {stderr}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let marker = format!("{RULE_COMMENT_PREFIX}{pid}-{suffix}");
     let mut handles = Vec::new();
 
     for line in stdout.lines() {
