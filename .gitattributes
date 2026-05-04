@@ -1,0 +1,5 @@
+crates/gui/web/chart.min.js linguist-vendored
+
+docs/** linguist-documentation
+
+crates/gui/gen/** linguist-generated

@@ -325,6 +325,11 @@ pub fn rate_limit_process(pid: u32, rate_kbps: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Removes rate-limit rules for one process.
+pub fn unlimit_process(pid: u32) -> Result<(), String> {
+    remove_rules_for_scope(&scope_key("rate-proc", pid.to_string()))
+}
+
 /// Limits the bandwidth for one thread.
 pub fn rate_limit_thread(pid: u32, tid: u32, rate_kbps: u32) -> Result<(), String> {
     let _ = setup_nftables();
@@ -353,6 +358,11 @@ pub fn rate_limit_thread(pid: u32, tid: u32, rate_kbps: u32) -> Result<(), Strin
     Ok(())
 }
 
+/// Removes rate-limit rules for one thread.
+pub fn unlimit_thread(pid: u32, tid: u32) -> Result<(), String> {
+    remove_rules_for_scope(&scope_key("rate-thread", format!("{pid}:{tid}")))
+}
+
 /// Limits the bandwidth for one user by UID.
 pub fn rate_limit_user(uid: u32, rate_kbps: u32) -> Result<(), String> {
     let _ = setup_nftables();
@@ -374,6 +384,11 @@ pub fn rate_limit_user(uid: u32, rate_kbps: u32) -> Result<(), String> {
 
     register_rule_handles(&scope_key, handles)?;
     Ok(())
+}
+
+/// Removes rate-limit rules for one user.
+pub fn unlimit_user(uid: u32) -> Result<(), String> {
+    remove_rules_for_scope(&scope_key("rate-user", uid.to_string()))
 }
 
 // Builds an nftables ruleset script with TCP and UDP sport drop rules.

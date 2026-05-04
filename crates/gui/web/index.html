@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>netmon</title>
+    <link rel="stylesheet" href="app.css" />
+  </head>
+  <body>
+    <div class="app">
+      <section class="controls">
+        <div class="control-group">
+          <label for="ifaceSelect">Interface</label>
+          <select id="ifaceSelect"></select>
+          <button id="refreshBtn" type="button">Refresh</button>
+        </div>
+        <div class="control-group">
+          <label for="filterInput">BPF filter</label>
+          <input id="filterInput" type="text" placeholder="tcp and port 443" />
+          <button id="applyFilterBtn" type="button">Apply</button>
+        </div>
+        <div class="control-group">
+          <button id="startBtn" type="button">Start</button>
+          <button id="stopBtn" type="button">Stop</button>
+        </div>
+      </section>
+
+      <section class="stats">
+        <div class="card">
+          <span class="label">Current bandwidth</span>
+          <span id="currentBandwidth" class="value">0 B/s</span>
+        </div>
+        <div class="card">
+          <span class="label">Peak bandwidth</span>
+          <span id="peakBandwidth" class="value">0 B/s</span>
+        </div>
+        <div class="card">
+          <span class="label">Total bytes</span>
+          <span id="totalBytes" class="value">0 B</span>
+        </div>
+        <div class="card">
+          <span class="label">Active threads</span>
+          <span id="activeThreads" class="value">0</span>
+        </div>
+        <div class="card">
+          <span class="label">Blocked</span>
+          <span id="blockedCounts" class="value">0</span>
+        </div>
+      </section>
+
+      <section class="graph-panel">
+        <div class="panel-head">
+          <div class="panel-title">Traffic (TX/RX per second)</div>
+          <div class="panel-controls">
+            <label for="windowSizeRange">Window</label>
+            <input id="windowSizeRange" type="range" min="30" max="300" step="10" value="120" />
+            <span id="windowSizeLabel">120s</span>
+          </div>
+        </div>
+        <div class="chart-frame">
+          <canvas id="trafficGraph"></canvas>
+        </div>
+      </section>
+
+      <section class="split">
+        <div class="panel left-panel">
+          <div class="panel-title">Processes</div>
+          <table class="process-table">
+            <thead>
+              <tr>
+                <th>PID/TID</th>
+                <th>Process</th>
+                <th>Thread</th>
+                <th>User</th>
+                <th>TX/s</th>
+                <th>RX/s</th>
+                <th>TX</th>
+                <th>RX</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="processTable"></tbody>
+          </table>
+        </div>
+
+        <div class="panel right-panel">
+          <div class="detail-header">
+            <div>
+              <div class="panel-title">Details</div>
+              <div id="selectedSummary" class="detail-summary">No process selected</div>
+            </div>
+          </div>
+
+          <div class="detail-section">
+            <div class="section-title">Selected TX/RX (per second)</div>
+            <div class="chart-frame compact">
+              <canvas id="processGraph"></canvas>
+            </div>
+          </div>
+
+          <div class="detail-section">
+            <div class="section-title">Controls</div>
+            <div class="control-grid">
+              <div class="control-block">
+                <div class="control-label">Process</div>
+                <div class="control-actions">
+                  <button id="blockProcessBtn" type="button" class="warn">Block</button>
+                  <button id="unblockProcessBtn" type="button" class="secondary">Unblock</button>
+                </div>
+                <div class="control-actions">
+                  <input id="processRateInput" type="number" min="1" placeholder="KB/s" />
+                  <button id="limitProcessBtn" type="button" class="ok">Limit</button>
+                  <button id="clearProcessBtn" type="button" class="secondary">Clear</button>
+                </div>
+              </div>
+              <div class="control-block">
+                <div class="control-label">Thread</div>
+                <div class="control-actions">
+                  <button id="blockThreadBtn" type="button" class="warn">Block</button>
+                  <button id="unblockThreadBtn" type="button" class="secondary">Unblock</button>
+                </div>
+                <div class="control-actions">
+                  <input id="threadRateInput" type="number" min="1" placeholder="KB/s" />
+                  <button id="limitThreadBtn" type="button" class="ok">Limit</button>
+                  <button id="clearThreadBtn" type="button" class="secondary">Clear</button>
+                </div>
+              </div>
+              <div class="control-block">
+                <div class="control-label">User</div>
+                <div class="control-actions">
+                  <button id="blockUserBtn" type="button" class="warn">Block</button>
+                  <button id="unblockUserBtn" type="button" class="secondary">Unblock</button>
+                </div>
+                <div class="control-actions">
+                  <input id="userRateInput" type="number" min="1" placeholder="KB/s" />
+                  <button id="limitUserBtn" type="button" class="ok">Limit</button>
+                  <button id="clearUserBtn" type="button" class="secondary">Clear</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="detail-section">
+            <div class="section-title">Connections</div>
+            <table class="connection-table">
+              <thead>
+                <tr>
+                  <th>Local</th>
+                  <th>Remote</th>
+                  <th>Proto</th>
+                  <th>State</th>
+                  <th>Thread</th>
+                  <th>TX</th>
+                  <th>RX</th>
+                </tr>
+              </thead>
+              <tbody id="connectionTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <footer class="status-bar">
+      <span class="label">Status</span>
+      <span id="statusText" class="value">Ready</span>
+    </footer>
+
+    <script src="chart.min.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
