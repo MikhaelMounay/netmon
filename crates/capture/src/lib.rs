@@ -101,6 +101,7 @@ pub struct FlowRecord {
 #[derive(Debug, Clone)]
 pub enum CaptureCommand {
     ApplyFilter(String),
+    Flush,
     Stop,
 }
 
@@ -122,6 +123,13 @@ impl CaptureControl {
     pub fn stop(&self) -> Result<(), CaptureError> {
         self.cmd_tx
             .send(CaptureCommand::Stop)
+            .map_err(|e| CaptureError::ChannelSend(e.to_string()))
+    }
+
+    /// Flushes the active PCAP savefile if recording is enabled.
+    pub fn flush(&self) -> Result<(), CaptureError> {
+        self.cmd_tx
+            .send(CaptureCommand::Flush)
             .map_err(|e| CaptureError::ChannelSend(e.to_string()))
     }
 
@@ -230,7 +238,7 @@ fn run_capture_loop(
     let mut packets_since_flush: u32 = 0;
 
     while running.load(Ordering::Relaxed) {
-        if handle_pending_commands(capture, &command_receiver, &status_tx) {
+        if handle_pending_commands(capture, &command_receiver, &status_tx, &mut savefile) {
             break;
         }
 
@@ -273,18 +281,34 @@ fn handle_pending_commands(
     capture: &mut Capture<Active>,
     command_receiver: &Receiver<CaptureCommand>,
     status_tx: &Sender<String>,
+    savefile: &mut Option<Savefile>,
 ) -> bool {
     loop {
         match command_receiver.try_recv() {
             Ok(CaptureCommand::ApplyFilter(filter_expression)) => {
                 // Phase I Lesson WS-1: apply kernel-space BPF to reduce user-space load.
-                match capture.filter(&filter_expression, true) {
+                let expr = if filter_expression.trim().is_empty() {
+                    "ip or ip6 or arp"
+                } else {
+                    filter_expression.as_str()
+                };
+                match capture.filter(expr, true) {
                     Ok(()) => {
-                        let _ = status_tx.send(format!("Filter applied: {filter_expression}"));
+                        if filter_expression.trim().is_empty() {
+                            let _ = status_tx.send("Filter cleared".to_string());
+                        } else {
+                            let _ = status_tx.send(format!("Filter applied: {filter_expression}"));
+                        }
                     }
                     Err(error) => {
                         let _ = status_tx.send(format!("BPF error: {error}"));
                     }
+                }
+            }
+            Ok(CaptureCommand::Flush) => {
+                if let Some(file) = savefile.as_mut() {
+                    let _ = file.flush();
+                    let _ = status_tx.send("PCAP flushed".to_string());
                 }
             }
             Ok(CaptureCommand::Stop) => return true,

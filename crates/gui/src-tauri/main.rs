@@ -1,15 +1,17 @@
 #![deny(warnings)]
 
 use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aggregator::{spawn_aggregator_thread, AggregatorControl, InterfaceStats, ProcessRow, ThreadKey};
+use aggregator::{spawn_aggregator_thread, AggregatorControl, HistoryCsvRow, InterfaceStats, ProcessRow, ThreadKey};
 use capture::{spawn_capture_thread, CaptureControl, FlowRecord, Protocol};
 use controller as net_controller;
 use serde::Serialize;
@@ -43,6 +45,9 @@ struct AppState {
     rate_limited_pids: Arc<RwLock<HashSet<u32>>>,
     rate_limited_threads: Arc<RwLock<HashSet<ThreadKey>>>,
     rate_limited_users: Arc<RwLock<HashSet<u32>>>,
+    active_filter: Arc<RwLock<String>>,
+    session_history_snapshot: Arc<RwLock<Vec<HistoryCsvRow>>>,
+    pcap_record_path: Mutex<Option<PathBuf>>,
     status_tx: Sender<String>,
 }
 
@@ -58,7 +63,9 @@ impl AppState {
         let rate_limited_pids = Arc::new(RwLock::new(HashSet::new()));
         let rate_limited_threads = Arc::new(RwLock::new(HashSet::new()));
         let rate_limited_users = Arc::new(RwLock::new(HashSet::new()));
+        let active_filter = Arc::new(RwLock::new(String::new()));
         let session_history_snapshot = Arc::new(RwLock::new(Vec::new()));
+        let pcap_record_path = Mutex::new(None);
 
         let (tx_flow, rx_flow) = mpsc::sync_channel::<FlowRecord>(FLOW_CHANNEL_DEPTH);
         let (status_tx, status_rx) = mpsc::channel::<String>();
@@ -95,6 +102,9 @@ impl AppState {
             rate_limited_pids,
             rate_limited_threads,
             rate_limited_users,
+            active_filter,
+            session_history_snapshot,
+            pcap_record_path,
             status_tx,
         }
     }
@@ -164,6 +174,55 @@ fn list_pcap_devices() -> Vec<DeviceInfo> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn generate_pcap_path() -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("netmon_capture_{ts}.pcap"))
+}
+
+fn sanitize_csv(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    if escaped.contains(',') || escaped.contains('\n') || escaped.contains('"') {
+        format!("\"{escaped}\"")
+    } else {
+        escaped
+    }
+}
+
+fn write_history_csv(rows: &[HistoryCsvRow], path: &Path) -> Result<(), String> {
+    let file = File::create(path).map_err(|err| err.to_string())?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(
+            b"timestamp,pid,tid,process,thread,user,uid,tx_bytes_total,rx_bytes_total,tx_2s_avg,rx_2s_avg,tx_10s_avg,rx_10s_avg\n",
+        )
+        .map_err(|err| err.to_string())?;
+
+    for row in rows {
+        let line = format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            row.timestamp,
+            row.pid,
+            row.tid,
+            sanitize_csv(&row.process),
+            sanitize_csv(&row.thread),
+            sanitize_csv(&row.user),
+            row.uid,
+            row.tx_bytes_total,
+            row.rx_bytes_total,
+            row.tx_2s_avg,
+            row.rx_2s_avg,
+            row.tx_10s_avg,
+            row.rx_10s_avg,
+        );
+        writer.write_all(line.as_bytes()).map_err(|err| err.to_string())?;
+    }
+    writer.flush().map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -305,7 +364,9 @@ fn start_capture(
         }
     };
 
-    let recording_path = record_path.map(PathBuf::from);
+    let recording_path = record_path
+        .map(PathBuf::from)
+        .or_else(|| Some(generate_pcap_path()));
 
     let control = match spawn_capture_thread(
         &selected.name,
@@ -313,7 +374,7 @@ fn start_capture(
         state.tx_flow.clone(),
         state.capture_running.clone(),
         state.status_tx.clone(),
-        recording_path,
+        recording_path.clone(),
     ) {
         Ok(control) => control,
         Err(err) => {
@@ -322,7 +383,7 @@ fn start_capture(
         }
     };
 
-    if let Some(filter) = bpf_filter {
+    if let Some(filter) = bpf_filter.clone() {
         if let Err(err) = control.apply_filter(filter) {
             state.capture_running.store(false, Ordering::Relaxed);
             return Err(err.to_string());
@@ -337,6 +398,16 @@ fn start_capture(
         }
     };
     *guard = Some(control);
+
+    if let Ok(mut history) = state.session_history_snapshot.write() {
+        history.clear();
+    }
+    if let Ok(mut record_guard) = state.pcap_record_path.lock() {
+        *record_guard = recording_path;
+    }
+    if let Ok(mut active_filter) = state.active_filter.write() {
+        *active_filter = bpf_filter.unwrap_or_default();
+    }
 
     Ok(())
 }
@@ -357,8 +428,12 @@ fn apply_filter(state: State<'_, AppState>, bpf_filter: String) -> Result<(), St
         .as_mut()
         .ok_or_else(|| "capture not running".to_string())?;
     control
-        .apply_filter(bpf_filter)
-        .map_err(|err| err.to_string())
+        .apply_filter(bpf_filter.clone())
+        .map_err(|err| err.to_string())?;
+    if let Ok(mut active_filter) = state.active_filter.write() {
+        *active_filter = bpf_filter;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -477,11 +552,19 @@ fn get_snapshot(
         })
         .collect::<Vec<_>>();
 
+    let filter_active = state
+        .active_filter
+        .read()
+        .map(|guard| !guard.trim().is_empty())
+        .unwrap_or(false);
     let mut connections = Vec::new();
     for row in rows {
         for entry in row.connections {
             if connections.len() >= max_connections {
                 break;
+            }
+            if filter_active && entry.tx_bytes == 0 && entry.rx_bytes == 0 {
+                continue;
             }
             connections.push(ConnectionDto {
                 local_addr: entry.local_addr.to_string(),
@@ -652,6 +735,39 @@ fn unlimit_user(state: State<'_, AppState>, uid: u32) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn export_csv(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let rows = state
+        .session_history_snapshot
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    write_history_csv(&rows, Path::new(&path))
+}
+
+#[tauri::command]
+fn export_pcap(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    if let Ok(guard) = state.capture_control.lock() {
+        if let Some(control) = guard.as_ref() {
+            let _ = control.flush();
+        }
+    }
+
+    let source = state
+        .pcap_record_path
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .ok_or_else(|| "no PCAP recording available".to_string())?;
+
+    if !source.exists() {
+        return Err("PCAP recording file missing".to_string());
+    }
+
+    fs::copy(&source, &path).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 fn main() {
     env_logger::init();
     let state = AppState::new();
@@ -676,7 +792,9 @@ fn main() {
             rate_limit_thread,
             unlimit_thread,
             rate_limit_user,
-            unlimit_user
+            unlimit_user,
+            export_csv,
+            export_pcap
         ])
         .build(tauri::generate_context!())
         .expect("error while running netmon")

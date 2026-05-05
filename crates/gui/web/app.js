@@ -36,6 +36,8 @@ const refreshBtn = document.getElementById("refreshBtn");
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const applyFilterBtn = document.getElementById("applyFilterBtn");
+const exportCsvBtn = document.getElementById("exportCsvBtn");
+const exportPcapBtn = document.getElementById("exportPcapBtn");
 
 const SNAPSHOT_TOP_N = 25;
 const SNAPSHOT_MAX_CONNECTIONS = 200;
@@ -45,10 +47,17 @@ const GRAPH_COLOR_RX = "#f7b267";
 const CHART_TICK_COLOR = "#c7d1d8";
 const CHART_GRID_COLOR = "rgba(84, 96, 109, 0.35)";
 
+const SORT_DEFAULT = { key: "pid_tid", dir: "asc" };
+
 let selectedKey = null;
 let lastSnapshot = null;
 let trafficChart = null;
 let processChart = null;
+let sortState = { ...SORT_DEFAULT };
+
+const sortableHeaders = document.querySelectorAll(
+  ".process-table thead th.sortable"
+);
 
 function formatBytes(bytes) {
   if (bytes < 1024) {
@@ -186,6 +195,105 @@ function buildStatusBadges(proc) {
   return badges;
 }
 
+function statusScore(proc) {
+  let score = 0;
+  if (proc.is_process_blocked) score += 8;
+  if (proc.is_thread_blocked) score += 4;
+  if (proc.is_user_blocked) score += 2;
+  if (proc.is_process_rate_limited) score += 1.5;
+  if (proc.is_thread_rate_limited) score += 1;
+  if (proc.is_user_rate_limited) score += 0.5;
+  return score;
+}
+
+function compareProcesses(a, b) {
+  const dir = sortState.dir === "asc" ? 1 : -1;
+  switch (sortState.key) {
+    case "pid_tid": {
+      if (a.pid !== b.pid) return (a.pid - b.pid) * dir;
+      return (a.tid - b.tid) * dir;
+    }
+    case "process":
+      return a.process.localeCompare(b.process) * dir;
+    case "thread":
+      return a.thread.localeCompare(b.thread) * dir;
+    case "user":
+      return a.user.localeCompare(b.user) * dir;
+    case "tx_rate":
+      return (a.tx_rate_bytes_per_sec - b.tx_rate_bytes_per_sec) * dir;
+    case "rx_rate":
+      return (a.rx_rate_bytes_per_sec - b.rx_rate_bytes_per_sec) * dir;
+    case "tx_bytes":
+      return (a.tx_bytes - b.tx_bytes) * dir;
+    case "rx_bytes":
+      return (a.rx_bytes - b.rx_bytes) * dir;
+    case "status": {
+      const diff = statusScore(a) - statusScore(b);
+      if (diff !== 0) return diff * dir;
+      if (a.pid !== b.pid) return (a.pid - b.pid) * dir;
+      return (a.tid - b.tid) * dir;
+    }
+    default:
+      return 0;
+  }
+}
+
+function updateSortIndicators() {
+  sortableHeaders.forEach((th) => {
+    th.classList.remove("sort-asc", "sort-desc");
+    if (th.dataset.sort === sortState.key) {
+      th.classList.add(sortState.dir === "asc" ? "sort-asc" : "sort-desc");
+    }
+  });
+}
+
+async function showSaveDialog(options) {
+  const dialogApi = window.__TAURI__?.dialog || window.__TAURI__?.plugin?.dialog;
+  if (dialogApi?.save) {
+    return await dialogApi.save(options);
+  }
+  const fallback = window.prompt("Save file path", options?.defaultPath || "");
+  return fallback ? fallback.trim() : null;
+}
+
+async function exportCsv() {
+  if (!invoke) {
+    return;
+  }
+  const path = await showSaveDialog({
+    defaultPath: "netmon_history.csv",
+    filters: [{ name: "CSV", extensions: ["csv"] }],
+  });
+  if (!path) {
+    return;
+  }
+  try {
+    await invoke("export_csv", { path });
+    setStatus(`CSV exported: ${path}`);
+  } catch (err) {
+    setStatus(String(err));
+  }
+}
+
+async function exportPcap() {
+  if (!invoke) {
+    return;
+  }
+  const path = await showSaveDialog({
+    defaultPath: "netmon_capture.pcap",
+    filters: [{ name: "PCAP", extensions: ["pcap"] }],
+  });
+  if (!path) {
+    return;
+  }
+  try {
+    await invoke("export_pcap", { path });
+    setStatus(`PCAP exported: ${path}`);
+  } catch (err) {
+    setStatus(String(err));
+  }
+}
+
 function updateChart(chart, txHistory, rxHistory) {
   if (!chart || !txHistory || !rxHistory) {
     return;
@@ -258,13 +366,13 @@ async function applyFilter() {
     return;
   }
   const filter = filterInput.value.trim();
-  if (!filter) {
-    setStatus("Filter empty");
-    return;
-  }
   try {
-    await invoke("apply_filter", { bpf_filter: filter });
-    setStatus(`Filter applied: ${filter}`);
+    await invoke("apply_filter", { bpfFilter: filter });
+    if (filter) {
+      setStatus(`Filter applied: ${filter}`);
+    } else {
+      setStatus("Filter cleared");
+    }
   } catch (err) {
     setStatus(String(err));
   }
@@ -272,7 +380,8 @@ async function applyFilter() {
 
 function renderProcesses(processes) {
   processTable.innerHTML = "";
-  processes.forEach((proc) => {
+  const sorted = [...processes].sort(compareProcesses);
+  sorted.forEach((proc) => {
     const key = `${proc.pid}:${proc.tid}`;
     const row = document.createElement("tr");
     if (selectedKey === key) {
@@ -445,6 +554,8 @@ refreshBtn.addEventListener("click", loadDevices);
 startBtn.addEventListener("click", startCapture);
 stopBtn.addEventListener("click", stopCapture);
 applyFilterBtn.addEventListener("click", applyFilter);
+exportCsvBtn.addEventListener("click", exportCsv);
+exportPcapBtn.addEventListener("click", exportPcap);
 windowSizeRange.addEventListener("input", () => {
   updateWindowLabel();
   if (lastSnapshot) {
@@ -453,7 +564,26 @@ windowSizeRange.addEventListener("input", () => {
   }
 });
 
+sortableHeaders.forEach((th) => {
+  th.addEventListener("click", () => {
+    const key = th.dataset.sort;
+    if (!key) {
+      return;
+    }
+    if (sortState.key === key) {
+      sortState.dir = sortState.dir === "asc" ? "desc" : "asc";
+    } else {
+      sortState = { key, dir: "asc" };
+    }
+    updateSortIndicators();
+    if (lastSnapshot) {
+      renderProcesses(lastSnapshot.processes);
+    }
+  });
+});
+
 updateWindowLabel();
+updateSortIndicators();
 trafficChart = buildChart(trafficGraph);
 processChart = buildChart(processGraph);
 setControlsEnabled(false);

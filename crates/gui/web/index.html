@@ -15,13 +15,20 @@
           <button id="refreshBtn" type="button">Refresh</button>
         </div>
         <div class="control-group">
+          <button id="startBtn" type="button">Start</button>
+          <button id="stopBtn" type="button">Stop</button>
+        </div>
+        <div class="control-spacer" aria-hidden="true"></div>
+        <div class="control-group">
           <label for="filterInput">BPF filter</label>
           <input id="filterInput" type="text" placeholder="tcp and port 443" />
           <button id="applyFilterBtn" type="button">Apply</button>
         </div>
+        <div class="control-spacer" aria-hidden="true"></div>
         <div class="control-group">
-          <button id="startBtn" type="button">Start</button>
-          <button id="stopBtn" type="button">Stop</button>
+          <label>Export</label>
+          <button id="exportCsvBtn" type="button" class="secondary">Export CSV</button>
+          <button id="exportPcapBtn" type="button" class="secondary">Export PCAP</button>
         </div>
       </section>
 
@@ -65,22 +72,35 @@
       <section class="split">
         <div class="panel left-panel">
           <div class="panel-title">Processes</div>
-          <table class="process-table">
-            <thead>
-              <tr>
-                <th>PID/TID</th>
-                <th>Process</th>
-                <th>Thread</th>
-                <th>User</th>
-                <th>TX/s</th>
-                <th>RX/s</th>
-                <th>TX</th>
-                <th>RX</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody id="processTable"></tbody>
-          </table>
+          <div class="table-scroll">
+            <table class="process-table">
+              <colgroup>
+                <col class="col-id" />
+                <col class="col-process" />
+                <col class="col-thread" />
+                <col class="col-user" />
+                <col class="col-rate" />
+                <col class="col-rate" />
+                <col class="col-bytes" />
+                <col class="col-bytes" />
+                <col class="col-status" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th class="sortable" data-sort="pid_tid">PID/TID <span class="sort-indicator"></span></th>
+                  <th class="sortable" data-sort="process">Process <span class="sort-indicator"></span></th>
+                  <th class="sortable" data-sort="thread">Thread <span class="sort-indicator"></span></th>
+                  <th class="sortable" data-sort="user">User <span class="sort-indicator"></span></th>
+                  <th class="sortable" data-sort="tx_rate">TX/s <span class="sort-indicator"></span></th>
+                  <th class="sortable" data-sort="rx_rate">RX/s <span class="sort-indicator"></span></th>
+                  <th class="sortable" data-sort="tx_bytes">TX <span class="sort-indicator"></span></th>
+                  <th class="sortable" data-sort="rx_bytes">RX <span class="sort-indicator"></span></th>
+                  <th class="sortable" data-sort="status">Status <span class="sort-indicator"></span></th>
+                </tr>
+              </thead>
+              <tbody id="processTable"></tbody>
+            </table>
+          </div>
         </div>
 
         <div class="panel right-panel">

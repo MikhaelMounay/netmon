@@ -41,6 +41,11 @@ body {
   box-shadow: 0 2px 6px var(--shadow);
 }
 
+.control-spacer {
+  flex: 0 0 16px;
+  height: 1px;
+}
+
 .control-group {
   display: flex;
   align-items: center;
@@ -222,6 +227,80 @@ tbody td {
   background: #222d3a;
 }
 
+.table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+
+.table-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+
+.table-scroll::-webkit-scrollbar-thumb {
+  background: var(--panel-dark);
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.process-table {
+  table-layout: fixed;
+  min-width: 900px;
+}
+
+.process-table th,
+.process-table td {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.process-table thead th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.process-table thead th.sortable .sort-indicator {
+  margin-left: 6px;
+  color: var(--muted);
+}
+
+.process-table thead th.sort-asc .sort-indicator::after {
+  content: "^";
+}
+
+.process-table thead th.sort-desc .sort-indicator::after {
+  content: "v";
+}
+
+.col-id {
+  width: 90px;
+}
+
+.col-process {
+  width: 160px;
+}
+
+.col-thread {
+  width: 160px;
+}
+
+.col-user {
+  width: 120px;
+}
+
+.col-rate {
+  width: 90px;
+}
+
+.col-bytes {
+  width: 90px;
+}
+
+.col-status {
+  width: 180px;
+}
+
 .detail-header {
   display: flex;
   justify-content: space-between;
@@ -270,6 +349,7 @@ tbody td {
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
+  white-space: normal;
 }
 
 .status-badge {
