@@ -109,6 +109,10 @@
               <div class="panel-title">Details</div>
               <div id="selectedSummary" class="detail-summary">No process selected</div>
             </div>
+            <div id="limitStatus" class="limit-status">
+              <span class="limit-label">Limit</span>
+              <span id="limitStatusValue" class="limit-badge">None</span>
+            </div>
           </div>
 
           <div class="detail-section">
@@ -155,6 +159,13 @@
                   <input id="userRateInput" type="number" min="1" placeholder="KB/s" />
                   <button id="limitUserBtn" type="button" class="ok">Limit</button>
                   <button id="clearUserBtn" type="button" class="secondary">Clear</button>
+                </div>
+              </div>
+              <div class="control-block">
+                <div class="control-label">Test</div>
+                <div class="control-actions">
+                  <button id="testDownloadBtn" type="button">Test Download</button>
+                  <span id="testDownloadResult" class="test-output">Idle</span>
                 </div>
               </div>
             </div>

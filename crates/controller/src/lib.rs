@@ -9,7 +9,9 @@
 //! nftables matching does not include a direct process-id selector.
 
 use std::collections::{BTreeSet, HashMap};
+use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -193,7 +195,7 @@ pub fn block_process(pid: u32, process_name: &str) -> Result<(), String> {
 pub fn unblock_process(pid: u32) -> Result<(), String> {
     // Phase I Lesson TC-3: ensure reversible control actions with explicit rollback path.
     remove_rules_for_scope(&scope_key("proc", pid.to_string()))?;
-    remove_rules_for_scope(&scope_key("rate-proc", pid.to_string()))
+    remove_tc_limit_for_scope(&scope_key("rate-proc", pid.to_string()))
 }
 
 /// Blocks outgoing traffic for one thread by inserting nftables drop rules.
@@ -227,7 +229,7 @@ pub fn block_thread(pid: u32, tid: u32, thread_name: &str) -> Result<(), String>
 /// Removes all tracked nftables rules associated with one thread.
 pub fn unblock_thread(pid: u32, tid: u32) -> Result<(), String> {
     remove_rules_for_scope(&scope_key("thread", format!("{pid}:{tid}")))?;
-    remove_rules_for_scope(&scope_key("rate-thread", format!("{pid}:{tid}")))
+    remove_tc_limit_for_scope(&scope_key("rate-thread", format!("{pid}:{tid}")))
 }
 
 /// Blocks outgoing traffic for one user by UID.
@@ -256,7 +258,7 @@ pub fn block_user(uid: u32, username: &str) -> Result<(), String> {
 /// Removes all tracked nftables rules associated with one user.
 pub fn unblock_user(uid: u32) -> Result<(), String> {
     remove_rules_for_scope(&scope_key("user", uid.to_string()))?;
-    remove_rules_for_scope(&scope_key("rate-user", uid.to_string()))
+    remove_tc_limit_for_scope(&scope_key("rate-user", uid.to_string()))
 }
 
 /// Flushes the output chain and clears all tracked process-to-rule mappings.
@@ -285,57 +287,30 @@ pub fn list_rules() -> Result<Vec<String>, String> {
     Ok(stdout.lines().map(ToString::to_string).collect())
 }
 
-/// Placeholder for future process rate limiting via tc HTB.
+/// Limits process bandwidth using tc HTB shaping.
 pub fn rate_limit_process(pid: u32, rate_kbps: u32) -> Result<(), String> {
-    let _ = setup_nftables();
-
     let scope_key = scope_key("rate-proc", pid.to_string());
-    remove_rules_for_scope(&scope_key)?;
+    remove_tc_limit_for_scope(&scope_key)?;
 
     let tcp_ports = collect_pid_ports(pid, &["tcp", "tcp6"])?;
     let udp_ports = collect_pid_ports(pid, &["udp", "udp6"])?;
-    let uid = read_uid_for_pid(pid);
 
-    let comment = scoped_comment(&scope_key, "rate-limit");
-
-    let rules = if tcp_ports.is_empty() && udp_ports.is_empty() {
-        if let Some(uid) = uid {
-            format!(
-                "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} \
-                 meta skuid {uid} quota over {rate_kbps} kbytes/second drop comment \"{comment}\"\n"
-            )
-        } else {
-            return Err(format!(
-                "No TCP/UDP ports and could not read UID for PID {pid}"
-            ));
-        }
-    } else {
-        build_rate_limit_ruleset(&tcp_ports, &udp_ports, &comment, rate_kbps)
-    };
-
-    run_nft_script(&rules)?;
-
-    let handles = find_rule_handles_by_marker(&scope_marker(&scope_key))?;
-    if handles.is_empty() {
-        return Err("Inserted rate-limit rules but could not find nft handles".to_string());
+    if tcp_ports.is_empty() && udp_ports.is_empty() {
+        return Err(format!("No TCP/UDP ports found for PID {pid}"));
     }
 
-    register_rule_handles(&scope_key, handles)?;
-
-    Ok(())
+    apply_tc_rate_limit(&scope_key, &tcp_ports, &udp_ports, rate_kbps)
 }
 
 /// Removes rate-limit rules for one process.
 pub fn unlimit_process(pid: u32) -> Result<(), String> {
-    remove_rules_for_scope(&scope_key("rate-proc", pid.to_string()))
+    remove_tc_limit_for_scope(&scope_key("rate-proc", pid.to_string()))
 }
 
 /// Limits the bandwidth for one thread.
 pub fn rate_limit_thread(pid: u32, tid: u32, rate_kbps: u32) -> Result<(), String> {
-    let _ = setup_nftables();
-
     let scope_key = scope_key("rate-thread", format!("{pid}:{tid}"));
-    remove_rules_for_scope(&scope_key)?;
+    remove_tc_limit_for_scope(&scope_key)?;
 
     let tcp_ports = collect_thread_ports(pid, tid, &["tcp", "tcp6"])?;
     let udp_ports = collect_thread_ports(pid, tid, &["udp", "udp6"])?;
@@ -344,51 +319,32 @@ pub fn rate_limit_thread(pid: u32, tid: u32, rate_kbps: u32) -> Result<(), Strin
         return Err(format!("No TCP/UDP ports found for PID {pid} TID {tid}"));
     }
 
-    let comment = scoped_comment(&scope_key, "rate-limit");
-    let rules = build_rate_limit_ruleset(&tcp_ports, &udp_ports, &comment, rate_kbps);
-
-    run_nft_script(&rules)?;
-
-    let handles = find_rule_handles_by_marker(&scope_marker(&scope_key))?;
-    if handles.is_empty() {
-        return Err("Inserted thread rate-limit rules but could not find nft handles".to_string());
-    }
-
-    register_rule_handles(&scope_key, handles)?;
-    Ok(())
+    apply_tc_rate_limit(&scope_key, &tcp_ports, &udp_ports, rate_kbps)
 }
 
 /// Removes rate-limit rules for one thread.
 pub fn unlimit_thread(pid: u32, tid: u32) -> Result<(), String> {
-    remove_rules_for_scope(&scope_key("rate-thread", format!("{pid}:{tid}")))
+    remove_tc_limit_for_scope(&scope_key("rate-thread", format!("{pid}:{tid}")))
 }
 
 /// Limits the bandwidth for one user by UID.
 pub fn rate_limit_user(uid: u32, rate_kbps: u32) -> Result<(), String> {
-    let _ = setup_nftables();
-
     let scope_key = scope_key("rate-user", uid.to_string());
-    remove_rules_for_scope(&scope_key)?;
+    remove_tc_limit_for_scope(&scope_key)?;
 
-    let comment = scoped_comment(&scope_key, "rate-limit");
-    let rule = format!(
-        "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} meta skuid {uid} quota over {rate_kbps} kbytes/second drop comment \"{comment}\"\n"
-    );
+    let tcp_ports = collect_uid_ports(uid, &["tcp", "tcp6"])?;
+    let udp_ports = collect_uid_ports(uid, &["udp", "udp6"])?;
 
-    run_nft_script(&rule)?;
-
-    let handles = find_rule_handles_by_marker(&scope_marker(&scope_key))?;
-    if handles.is_empty() {
-        return Err("Inserted user rate-limit rules but could not find nft handles".to_string());
+    if tcp_ports.is_empty() && udp_ports.is_empty() {
+        return Err(format!("No TCP/UDP ports found for UID {uid}"));
     }
 
-    register_rule_handles(&scope_key, handles)?;
-    Ok(())
+    apply_tc_rate_limit(&scope_key, &tcp_ports, &udp_ports, rate_kbps)
 }
 
 /// Removes rate-limit rules for one user.
 pub fn unlimit_user(uid: u32) -> Result<(), String> {
-    remove_rules_for_scope(&scope_key("rate-user", uid.to_string()))
+    remove_tc_limit_for_scope(&scope_key("rate-user", uid.to_string()))
 }
 
 // Builds an nftables ruleset script with TCP and UDP sport drop rules.
@@ -413,45 +369,42 @@ fn build_block_ruleset(tcp_ports: &BTreeSet<u16>, udp_ports: &BTreeSet<u16>, com
     ruleset
 }
 
-// Builds an nftables ruleset script that drops packets above the requested rate.
-fn build_rate_limit_ruleset(
-    tcp_ports: &BTreeSet<u16>,
-    udp_ports: &BTreeSet<u16>,
-    comment: &str,
-    rate_kbps: u32,
-) -> String {
-    let mut ruleset = String::new();
-    let rate_expr = format!("{rate_kbps} kbytes/second");
-
-    if !tcp_ports.is_empty() {
-        ruleset.push_str(&format!(
-            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} tcp sport {{ {} }} quota over {} drop comment \"{}\"\n",
-            join_ports(tcp_ports),
-            rate_expr,
-            comment
-        ));
-    }
-    if !udp_ports.is_empty() {
-        ruleset.push_str(&format!(
-            "add rule {NFT_FAMILY} {NFT_TABLE_NAME} {NFT_OUTPUT_CHAIN} udp sport {{ {} }} quota over {} drop comment \"{}\"\n",
-            join_ports(udp_ports),
-            rate_expr,
-            comment
-        ));
-    }
-
-    ruleset
-}
-
 // Reads source ports used by a PID from `/proc/<pid>/net/{tcp,tcp6,udp,udp6}`.
-fn collect_pid_ports(_pid: u32, files: &[&str]) -> Result<BTreeSet<u16>, String> {
-    collect_net_table_ports(files, None)
+fn collect_pid_ports(pid: u32, files: &[&str]) -> Result<BTreeSet<u16>, String> {
+    let fd_path = format!("/proc/{pid}/fd");
+    let socket_inodes = collect_socket_inodes(&fd_path);
+    collect_net_table_ports(files, Some(&socket_inodes))
 }
 
 // Reads source ports used by a single thread by following the thread's socket fds.
 fn collect_thread_ports(pid: u32, tid: u32, files: &[&str]) -> Result<BTreeSet<u16>, String> {
     let fd_path = format!("/proc/{pid}/task/{tid}/fd");
     let socket_inodes = collect_socket_inodes(&fd_path);
+    collect_net_table_ports(files, Some(&socket_inodes))
+}
+
+// Reads source ports for all processes that match a given UID.
+fn collect_uid_ports(uid: u32, files: &[&str]) -> Result<BTreeSet<u16>, String> {
+    let mut socket_inodes = BTreeSet::new();
+
+    let entries = fs::read_dir("/proc").map_err(|e| format!("failed to read /proc: {e}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid = match name.parse::<u32>() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        if read_uid_for_pid(pid) != Some(uid) {
+            continue;
+        }
+        let fd_path = format!("/proc/{pid}/fd");
+        socket_inodes.extend(collect_socket_inodes(&fd_path));
+    }
+
     collect_net_table_ports(files, Some(&socket_inodes))
 }
 
@@ -615,6 +568,289 @@ fn map_nft_spawn_error(err: std::io::Error) -> String {
             .to_string();
     }
     format!("failed to run nft: {err}")
+}
+
+// Runs one tc command and optionally ignores common idempotent errors.
+fn run_tc_command(args: &[&str], ignore_exists: bool, ignore_missing: bool) -> Result<(), String> {
+    let output = Command::new("tc")
+        .args(args)
+        .output()
+        .map_err(map_tc_spawn_error)?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stderr_lc = stderr.to_ascii_lowercase();
+    if ignore_exists
+        && (stderr.contains("File exists") || stderr.contains("RTNETLINK answers: File exists"))
+    {
+        return Ok(());
+    }
+    if ignore_missing
+        && (stderr_lc.contains("no such file")
+            || stderr_lc.contains("cannot find qdisc")
+            || stderr_lc.contains("no such file or directory")
+            || stderr_lc.contains("parent qdisc doesn't exist")
+            || stderr_lc.contains("parent qdisc does not exist")
+            || stderr_lc.contains("handle of zero")
+            || stderr_lc.contains("can't find specified filter chain")
+            || stderr_lc.contains("cannot find specified filter chain"))
+    {
+        return Ok(());
+    }
+
+    Err(format!("tc command error: {stderr}"))
+}
+
+// G-10: provide a clear operator message when tc CLI is missing.
+fn map_tc_spawn_error(err: std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        return "Shaping failed: tc not found. Install with: sudo apt-get install iproute2"
+            .to_string();
+    }
+    format!("failed to run tc: {err}")
+}
+
+// Returns the tc device name, optionally overridden via NETMON_TC_DEV.
+fn tc_device() -> Result<String, String> {
+    if let Ok(dev) = env::var("NETMON_TC_DEV") {
+        let trimmed = dev.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    default_interface()
+}
+
+// Determines the default route interface for tc shaping.
+fn default_interface() -> Result<String, String> {
+    let content = fs::read_to_string("/proc/net/route")
+        .map_err(|e| format!("failed to read /proc/net/route: {e}"))?;
+    for line in content.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 2 {
+            continue;
+        }
+        if cols[1] == "00000000" {
+            return Ok(cols[0].to_string());
+        }
+    }
+    Err("could not determine default interface (set NETMON_TC_DEV)".to_string())
+}
+
+// Builds a stable class ID for tc filters based on scope keys.
+fn tc_class_id(scope_key: &str) -> u16 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scope_key.hash(&mut hasher);
+    let raw = (hasher.finish() % 4000) as u16;
+    10 + raw
+}
+
+// Ensures the root qdisc/class for shaping is present.
+fn ensure_tc_root(dev: &str) -> Result<(), String> {
+    run_tc_command(&["qdisc", "del", "dev", dev, "root"], false, true)?;
+    run_tc_command(
+        &["qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "default", "1"],
+        true,
+        false,
+    )?;
+    run_tc_command(
+        &[
+            "class",
+            "replace",
+            "dev",
+            dev,
+            "parent",
+            "1:",
+            "classid",
+            "1:1",
+            "htb",
+            "rate",
+            "10000mbit",
+            "ceil",
+            "10000mbit",
+        ],
+        false,
+        false,
+    )?;
+    Ok(())
+}
+
+// Applies a rate limit using tc filters and classes for the given ports.
+fn apply_tc_rate_limit(
+    scope_key: &str,
+    tcp_ports: &BTreeSet<u16>,
+    udp_ports: &BTreeSet<u16>,
+    rate_kbps: u32,
+) -> Result<(), String> {
+    if rate_kbps == 0 {
+        return Err("rate_kbps must be greater than zero".to_string());
+    }
+
+    let dev = tc_device()?;
+    ensure_tc_root(&dev)?;
+
+    let class_id = tc_class_id(scope_key);
+    let classid = format!("1:{class_id}");
+    let rate = format!("{rate_kbps}kbit");
+
+    run_tc_command(
+        &[
+            "class",
+            "replace",
+            "dev",
+            dev.as_str(),
+            "parent",
+            "1:",
+            "classid",
+            classid.as_str(),
+            "htb",
+            "rate",
+            rate.as_str(),
+            "ceil",
+            rate.as_str(),
+        ],
+        false,
+        false,
+    )?;
+
+    let pref = class_id.to_string();
+    run_tc_command(
+        &[
+            "filter",
+            "del",
+            "dev",
+            dev.as_str(),
+            "parent",
+            "1:",
+            "protocol",
+            "ip",
+            "pref",
+            pref.as_str(),
+        ],
+        false,
+        true,
+    )?;
+    run_tc_command(
+        &[
+            "filter",
+            "del",
+            "dev",
+            dev.as_str(),
+            "parent",
+            "1:",
+            "protocol",
+            "ipv6",
+            "pref",
+            pref.as_str(),
+        ],
+        false,
+        true,
+    )?;
+
+    for port in tcp_ports {
+        add_tc_port_filter(&dev, &pref, &classid, "ip", "ip", 6, *port, "sport")?;
+        add_tc_port_filter(&dev, &pref, &classid, "ipv6", "ip6", 6, *port, "sport")?;
+    }
+    for port in udp_ports {
+        add_tc_port_filter(&dev, &pref, &classid, "ip", "ip", 17, *port, "sport")?;
+        add_tc_port_filter(&dev, &pref, &classid, "ipv6", "ip6", 17, *port, "sport")?;
+    }
+
+    Ok(())
+}
+
+// Removes tc filters/classes for a given scope.
+fn remove_tc_limit_for_scope(scope_key: &str) -> Result<(), String> {
+    let dev = tc_device()?;
+    let class_id = tc_class_id(scope_key);
+    let pref = class_id.to_string();
+    let classid = format!("1:{class_id}");
+
+    run_tc_command(
+        &[
+            "filter",
+            "del",
+            "dev",
+            dev.as_str(),
+            "parent",
+            "1:",
+            "protocol",
+            "ip",
+            "pref",
+            pref.as_str(),
+        ],
+        false,
+        true,
+    )?;
+    run_tc_command(
+        &[
+            "filter",
+            "del",
+            "dev",
+            dev.as_str(),
+            "parent",
+            "1:",
+            "protocol",
+            "ipv6",
+            "pref",
+            pref.as_str(),
+        ],
+        false,
+        true,
+    )?;
+    run_tc_command(
+        &["class", "del", "dev", dev.as_str(), "classid", classid.as_str()],
+        false,
+        true,
+    )?;
+    Ok(())
+}
+
+fn add_tc_port_filter(
+    dev: &str,
+    pref: &str,
+    classid: &str,
+    protocol_family: &str,
+    match_family: &str,
+    ip_proto: u8,
+    port: u16,
+    port_field: &str,
+) -> Result<(), String> {
+    let proto_text = ip_proto.to_string();
+    let port_text = port.to_string();
+
+    run_tc_command(
+        &[
+            "filter",
+            "replace",
+            "dev",
+            dev,
+            "parent",
+            "1:",
+            "protocol",
+            protocol_family,
+            "pref",
+            pref,
+            "u32",
+            "match",
+            match_family,
+            "protocol",
+            proto_text.as_str(),
+            "0xff",
+            "match",
+            match_family,
+            port_field,
+            port_text.as_str(),
+            "0xffff",
+            "flowid",
+            classid,
+        ],
+        false,
+        false,
+    )
 }
 
 // Finds nft rule handles by scanning chain lines with this comment marker.

@@ -59,6 +59,15 @@ body {
   letter-spacing: 1px;
 }
 
+.test-output {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-dark);
+}
+
 input,
 select,
 button {
@@ -305,6 +314,37 @@ tbody td {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+}
+
+.limit-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.limit-label {
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+}
+
+.limit-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #222a34;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.limit-badge.ok {
+  color: var(--ok);
+  border-color: rgba(61, 220, 151, 0.4);
 }
 
 .detail-summary {
