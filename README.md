@@ -1,6 +1,6 @@
 # netmon
 
-Netmon is a Linux desktop tool that captures live network traffic and shows it as per-process bandwidth and connection data in real time. It combines packet capture, process/user attribution, and traffic control in one interface so you can both observe and act from the same screen.
+netmon is a Linux desktop tool that captures live network traffic and shows it as per-process bandwidth and connection data in real time. It combines packet capture, process/user attribution, and traffic control in one interface so you can both observe and act from the same screen.
 
 Traditional tools often make you choose between packet-level visibility and process-level visibility. Wireshark is strong at packet inspection, and tools like iftop are strong at interface-level traffic, but neither gives this project's built-in workflow of mapping flows to PID/username and then immediately blocking that process through nftables.
 
@@ -11,20 +11,24 @@ The implementation is written in Rust and uses libpcap through the pcap crate fo
 ## Prerequisites
 
 - Ubuntu 22.04 or 24.04 (bare metal or VM)
-- Rust stable toolchain (install via rustup.rs)
+- Rust stable toolchain
 - libpcap development headers:
-  sudo apt-get install -y libpcap-dev nftables
+  `sudo apt-get install -y libpcap-dev nftables`
 - Root or CAP_NET_RAW + CAP_NET_ADMIN privileges
 
 ## Build
 
-git clone <repo>
+```
+git clone https://github.com/MikhaelMounay/netmon.git
 cd netmon
 cargo build --release
+```
 
 ## Run
 
+```
 sudo ./target/release/netmon
+```
 
 ## Notes
 
