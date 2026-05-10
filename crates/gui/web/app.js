@@ -32,8 +32,6 @@ const clearUserBtn = document.getElementById("clearUserBtn");
 const processRateInput = document.getElementById("processRateInput");
 const threadRateInput = document.getElementById("threadRateInput");
 const userRateInput = document.getElementById("userRateInput");
-const testDownloadBtn = document.getElementById("testDownloadBtn");
-const testDownloadResult = document.getElementById("testDownloadResult");
 
 const refreshBtn = document.getElementById("refreshBtn");
 const startBtn = document.getElementById("startBtn");
@@ -49,8 +47,6 @@ const GRAPH_COLOR_TX = "#4cc3ff";
 const GRAPH_COLOR_RX = "#f7b267";
 const CHART_TICK_COLOR = "#c7d1d8";
 const CHART_GRID_COLOR = "rgba(84, 96, 109, 0.35)";
-const TEST_DOWNLOAD_BYTES = 10 * 1024 * 1024;
-const TEST_DOWNLOAD_URL = "https://speed.cloudflare.com/__down";
 
 const SORT_DEFAULT = { key: "pid_tid", dir: "asc" };
 
@@ -95,48 +91,6 @@ function parseRateInput(input) {
   return value;
 }
 
-async function runDownloadTest() {
-  if (!testDownloadBtn || !testDownloadResult) {
-    return;
-  }
-  testDownloadBtn.disabled = true;
-  testDownloadResult.textContent = "Running...";
-  const startedAt = performance.now();
-  const url = `${TEST_DOWNLOAD_URL}?bytes=${TEST_DOWNLOAD_BYTES}&cacheBust=${Date.now()}`;
-
-  try {
-    const response = await fetch(url, { cache: "no-store" });
-    if (!response.ok || !response.body) {
-      throw new Error(`Download failed (${response.status})`);
-    }
-
-    const reader = response.body.getReader();
-    let total = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      if (value) {
-        total += value.length;
-      }
-      if (total >= TEST_DOWNLOAD_BYTES) {
-        await reader.cancel();
-        break;
-      }
-    }
-
-    const elapsedSec = (performance.now() - startedAt) / 1000;
-    const rateBps = elapsedSec > 0 ? total / elapsedSec : 0;
-    testDownloadResult.textContent = `${formatRate(rateBps)} (${formatBytes(total)})`;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    testDownloadResult.textContent = `Error: ${message}`;
-    setStatus(`Test failed: ${message}`);
-  } finally {
-    testDownloadBtn.disabled = false;
-  }
-}
 
 function getWindowSize() {
   const value = Number.parseInt(windowSizeRange.value, 10);
@@ -590,9 +544,7 @@ function renderDetails(snapshot) {
   };
   clearUserBtn.onclick = () => invoke("unlimit_user", { uid: selected.uid }).catch((err) => setStatus(String(err)));
 
-  if (testDownloadBtn) {
-    testDownloadBtn.onclick = () => runDownloadTest();
-  }
+  // Test download removed
 }
 
 async function refreshSnapshot() {
